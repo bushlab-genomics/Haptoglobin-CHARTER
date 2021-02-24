@@ -1,32 +1,48 @@
-*******************************************
-*Linux code for Pre-phasing and Imputation*
-*******************************************
+***************************************
+*Python code to curate reference files*
+***************************************
 
-# Pre-phasing of reference panels
-shapeit \
---input-gen /path/to/gen/file /path/to/sample/file \
--M /path/to/map/file \
--O /path/to/output \
---thread 12 \
---burn 20 \
---prune 10 \
---main 50
+# Convert BGL file into VCF format (do it for both EUR and AFR references):
+## First obtain a list of marker infomrations, including rsid, position, reference and alternative alleles from biomart.
+import pandas as pd
+import collections
+mk = pd.read_table("Europeans_HM3_Marker.txt", names = ['ID', 'POS', 'REF', 'ALT'], dtype = str, na_values = '0').dropna()
+mk.reset_index(drop = True, inplace = True)
+bgl = pd.read_table("Europeans_HM3_HPstructure.bgl", dtype = str)
+merge1 = pd.merge(mk, bgl, how = 'inner', left_on  = 'ID', right_on = 'id') # join by rsid
+merge1.drop(['I', 'id'], axis = 1, inplace = True) 
+merge1.sort_values(by = ['POS'], inplace = True)
+def rowreplace(x):
+    x[4:len(x)].replace(x['REF'], "0", inplace = True)
+    x[4:len(x)].replace(x['ALT'], "1", inplace = True)
+    x[4:len(x)].replace("?", ".", inplace = True)
+    return x
+recode=[]
+for i in range(0, merge1.shape[0]):
+    recode.append(rowreplace(merge1.loc[i,:]))
+recode = pd.DataFrame(recode)
+first=[]
+for i in range(4,recode.shape[1],2):
+    first.append(i)
+def dyploid(x):
+    dyp = []
+    dyp.append(x[0])
+    dyp.append(x[1])
+    dyp.append(x[2])
+    dyp.append(x[3])
+    for i in range(0,len(first)):
+        dyp.append(str(x[first[i]])+"|"+str(x[second[i]]))
+    return dyp
+dypl = []
+for i in range(0,recode.shape[0]):
+    dypl.append(dyploid(recode.loc[i,:]))
+dyp = pd.DataFrame(dypl, columns = list(recode.columns[0:4].append(recode.columns[first])))
+dyp['#CHROM'] = '16'
+dyp['QUAL'] = dyp['FILTER'] = dyp['INFO'] = dyp['FORMAT'] = None
+dyp = pd.concat([dyp['#CHROM'], dyp[['POS', 'ID', 'REF', 'ALT']], dyp[['QUAL','FILTER', 'INFO','FORMAT']], dyp.loc[:,dyp.columns[4:dyp.shape[0]-6]]], axis=1)
+dyp.to_csv("Europeans_HM3_HPstructure_phased_manually.vcf", sep = "\t", index = False, header = True)
 
-# HP Imputation
-impute2 \
--m /path/to/map/file \
--h /path/to/reference/hap/file \
--l /path/to/reference/legend/file \
--g /path/to/gen/file \
--burnin 300 \
--iter 500 \
--int 71070878 73097663 \
--o /path/to/output 
-
-***********************************
-*Python code to collapes HP marker*
-***********************************
-
+# Collapes HP marker:
 import pandas as pd;
 eur = pd.read_table('Europeans_HM3_HPstructure_phased_manually.vcf', dtype = str);
 afr = pd.read_table('Africans_HM3_HPstructure_phased_manually.vcf', dtype = str);
@@ -50,11 +66,40 @@ afr_hpc = collapse_hp_alleles(afr);
 afr_hpc.to_csv('Afr_HM3_HP_collapsed.vcf', sep = '\t', index = False);
 eur_hpc.to_csv('Eur_HM3_HP_collapsed.vcf', sep = '\t', index = False);
 
+*******************************************
+*Linux code for Pre-phasing and Imputation*
+*******************************************
+
+# Pre-phasing of reference panels (on HPC)
+shapeit \
+--input-vcf /path/to/vcf/input \
+-M /path/to/map/file \
+--output-max /prefix/of/output/hap.haps /prefix/of/output/sample.sample \
+--thread 16 \
+--burn 200 \
+--prune 50 \
+--main 100
+
+# Convert VCF into gen file (for IMPUTEv2 input):
+## using vcf2impute_gen.pl script downloaded from IMPUTEv2 website
+vcf2impute_gen -vcf /path/to/vcf -gen /path/to/output/gen
+
+# HP Imputation
+impute2 \
+-m /path/to/map/file \
+-h /path/to/reference/hap/file \
+-l /path/to/reference/legend/file \
+-g /path/to/gen/file \
+-burnin 300 \
+-iter 500 \
+-int 71070878 73097663 \
+-o /path/to/output 
+
 **************************
 *Python code for analyses*
 **************************
 
-# Curate Imputation Output (excute as a python script) and Hardcalling
+# Curate Imputation Output and Hardcalling (excute as a python script)
 
 #!/usr/bin/env python
 from sys import argv
