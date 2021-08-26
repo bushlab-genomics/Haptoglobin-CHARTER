@@ -1,0 +1,420 @@
+***************************************
+*Python code to curate reference files*
+***************************************
+
+# Convert BGL file into VCF format (do it for both EUR and AFR references):
+## First obtain a list of marker infomrations, including rsid, position, reference and alternative alleles from biomart.
+import pandas as pd
+import collections
+mk = pd.read_table("Europeans_HM3_Marker.txt", names = ['ID', 'POS', 'REF', 'ALT'], dtype = str, na_values = '0').dropna()
+mk.reset_index(drop = True, inplace = True)
+bgl = pd.read_table("Europeans_HM3_HPstructure.bgl", dtype = str)
+merge1 = pd.merge(mk, bgl, how = 'inner', left_on  = 'ID', right_on = 'id') # join by rsid
+merge1.drop(['I', 'id'], axis = 1, inplace = True) 
+merge1.sort_values(by = ['POS'], inplace = True)
+def rowreplace(x):
+    x[4:len(x)].replace(x['REF'], "0", inplace = True)
+    x[4:len(x)].replace(x['ALT'], "1", inplace = True)
+    x[4:len(x)].replace("?", ".", inplace = True)
+    return x
+recode=[]
+for i in range(0, merge1.shape[0]):
+    recode.append(rowreplace(merge1.loc[i,:]))
+recode = pd.DataFrame(recode)
+first=[]
+for i in range(4,recode.shape[1],2):
+    first.append(i)
+def dyploid(x):
+    dyp = []
+    dyp.append(x[0])
+    dyp.append(x[1])
+    dyp.append(x[2])
+    dyp.append(x[3])
+    for i in range(0,len(first)):
+        dyp.append(str(x[first[i]])+"|"+str(x[second[i]]))
+    return dyp
+dypl = []
+for i in range(0,recode.shape[0]):
+    dypl.append(dyploid(recode.loc[i,:]))
+dyp = pd.DataFrame(dypl, columns = list(recode.columns[0:4].append(recode.columns[first])))
+dyp['#CHROM'] = '16'
+dyp['QUAL'] = dyp['FILTER'] = dyp['INFO'] = dyp['FORMAT'] = None
+dyp = pd.concat([dyp['#CHROM'], dyp[['POS', 'ID', 'REF', 'ALT']], dyp[['QUAL','FILTER', 'INFO','FORMAT']], dyp.loc[:,dyp.columns[4:dyp.shape[0]-6]]], axis=1)
+dyp.to_csv("Europeans_HM3_HPstructure_phased_manually.vcf", sep = "\t", index = False, header = True)
+
+# Collapes HP marker:
+import pandas as pd;
+eur = pd.read_table('Europeans_HM3_HPstructure_phased_manually.vcf', dtype = str);
+afr = pd.read_table('Africans_HM3_HPstructure_phased_manually.vcf', dtype = str);
+eur_hp = eur[eur.ID.isin(['HP1F', 'HP1S','HP2FS','HP2SS'])];
+afr_hp = afr[afr.ID.isin(['HP1F', 'HP1S', 'HP2FS', 'HP2SS'])];
+def collapse_hp_alleles(x):
+    hp = hp2fs = x[x.ID == 'HP2FS'].reset_index(drop=True).copy();
+    hp2ss = x[x.ID == 'HP2SS'].reset_index(drop=True);
+    hp.POS = '72092040';
+    hp.ID = 'HP';
+    names = [i for i in x.columns if hp2fs.loc[0,i] == '0|0'];
+    hp.loc[0,names] = hp2ss.loc[0,names];
+    names = [i for i in x.columns if hp2fs.loc[0,i] == '1|0' and hp2ss.loc[0,i] == '0|1'];
+    hp.loc[0,names] = '1|1';
+    names = [i for i in x.columns if hp2fs.loc[0,i] == '0|1' and hp2ss.loc[0,i] == '1|0'];
+    hp.loc[0,names] = '1|1';
+    x = pd.concat([x,hp], axis = 0).sort_values('POS').reset_index(drop = True);
+    return x;
+eur_hpc = collapse_hp_alleles(eur);
+afr_hpc = collapse_hp_alleles(afr);
+afr_hpc.to_csv('Afr_HM3_HP_collapsed.vcf', sep = '\t', index = False);
+eur_hpc.to_csv('Eur_HM3_HP_collapsed.vcf', sep = '\t', index = False);
+
+*******************************************
+*Linux code for Pre-phasing and Imputation*
+*******************************************
+
+# Pre-phasing of reference panels (on HPC)
+shapeit \
+--input-vcf /path/to/vcf/input \
+-M /path/to/map/file \
+--output-max /prefix/of/output/hap.haps /prefix/of/output/sample.sample \
+--thread 16 \
+--burn 200 \
+--prune 50 \
+--main 100
+
+# Convert VCF into gen file (for IMPUTEv2 input):
+## using vcf2impute_gen.pl script downloaded from IMPUTEv2 website
+vcf2impute_gen -vcf /path/to/vcf -gen /path/to/output/gen
+
+# HP Imputation
+impute2 \
+-m /path/to/map/file \
+-h /path/to/reference/hap/file \
+-l /path/to/reference/legend/file \
+-g /path/to/gen/file \
+-burnin 300 \
+-iter 500 \
+-int 71070878 73097663 \
+-o /path/to/output 
+
+**************************
+*Python code for analyses*
+**************************
+
+# Curate Imputation Output and Hardcalling (excute as a python script)
+
+#!/usr/bin/env python
+from sys import argv
+file = argv[1]
+prefix = file[:-8]
+import pandas as pd
+import numpy as np
+#load data
+raw = pd.read_table(file, dtype = str)
+#extract only 'HP' lines
+all = raw.iloc[:,np.r_[2,9:len(raw.columns)]].copy() 
+hp = all.loc[all["ID"].isin(["HP1F", "HP1S", "HP2FS", "HP2SS"])].copy() #select only HP genotypes
+hp = hp.T
+idrep=hp.index[1:]
+id = idrep
+hp.columns = hp.iloc[0,:]; hp = hp[1:]
+#replace genotype coding with allele numbers:
+import re
+def sub(x) :
+    x = re.sub("\./\.", "0", x)
+    x = re.sub("0/1", "1", x)
+    x = re.sub("1/0", "1", x)
+    x = re.sub("1/1", "2", x)
+    x = re.sub("0/0", "0", x)
+    a = int(x)
+    return(a)
+hp = hp.applymap(sub)
+hp["hp_allele_dose"] = hp.sum(axis = 1)
+hp['id'] = id
+#construct genotypes:
+def genotype(x) :
+    names = ["HP1", "HP1", "HP2", "HP2"]
+    y = list(x[0:4].map(int))
+    if x['hp_allele_dose'] != 2:
+        b = 'NA'
+    elif 2 in y:
+        b = names[y.index(2)] + "/" + names[y.index(2)]
+    else: 
+        a = [i for i, a in enumerate(y) if a == 1]
+        b = names[a[0]] + "/" + names[a[1]]
+    return(b)
+geno = []
+for i in range(0, hp.shape[0]):
+    geno.append(genotype(hp.iloc[i,:]))
+hp["genotype"] = geno
+#if HPc is in the ID list
+def sub_hpc(x) :
+    x = re.sub("\./\.", "NA", x)
+    x = re.sub("0/1", "HP1/HP2", x)
+    x = re.sub("1/0", "HP1/HP2", x)
+    x = re.sub("1/1", "HP2/HP2", x)
+    x = re.sub("0/0", "HP1/HP1", x)
+    return(x)
+if 'HP' in all.ID.tolist():
+    hpc = all[all.ID.isin(['HP'])].copy().T
+    hpc.columns = hpc.iloc[0,:]; hpc = hpc[1:]
+    hp['HPC'] = hpc.values
+    hp["genotype_HPc"] = hpc.applymap(sub_hpc).values
+#output hp into file
+hp.to_csv(file+".hp.txt", sep = "\t", index = False)
+#count frequencies:
+from collections import Counter as counter
+freq = counter(hp["genotype"])
+print(prefix.split('/')[0], freq)
+
+# HWE test
+import pandas as pd;
+afr = pd.read_csv('Afr_charter_chr16_shapeit2_prephased_HP.HP_0.9.hp.csv').dropna()
+eur = pd.read_csv('Eur_charter_chr16_shapeit2_prephased_HP.HP_0.9.hp.csv').dropna()
+def hwt(gene) :
+    from collections import Counter
+    dct = Counter(gene)
+    allele = list(set([j for i in range(0,len(dct)) for j in list(dct.keys())[i].split('/') ]))
+    syb1 = allele[0]+'/'+allele[0]
+    syb2 = allele[1]+'/'+allele[1]
+    sybhet = allele[0]+'/'+allele[1]
+    if dct[sybhet] == 0:
+        sybhet = allele[1]+'/'+allele[0]
+    homo1 = dct[syb1]
+    het = dct[sybhet]
+    homo2 = dct[syb2]
+    allele1 = 2*homo1 + het
+    allele2 = 2*homo2 + het
+    total = 2*(homo1 + homo2 + het)
+    allele1_freq = allele1/total
+    allele2_freq = allele2/total
+    homo1_expect = total*(allele1_freq**2)/2
+    homo2_expect = total*(allele2_freq**2)/2
+    het_expect = total*allele1_freq*allele2_freq
+    chi_sqaure_homo1 = (homo1 - homo1_expect)**2/homo1_expect
+    chi_sqaure_homo2 = (homo2 - homo2_expect)**2/homo2_expect
+    chi_sqaure_het = (het - het_expect)**2/het_expect
+    sum_chi_sqaure = chi_sqaure_homo1 + chi_sqaure_homo2 + chi_sqaure_het
+    from tabulate import tabulate
+    print(tabulate([[syb1, homo1, homo1_expect, chi_sqaure_homo1],[sybhet, het, het_expect, chi_sqaure_het], [syb2, homo2, homo2_expect, chi_sqaure_homo2], ['Total', homo1 + het + homo2, homo1_expect + het_expect + homo2_expect, sum_chi_sqaure]], headers=['Genotypes', 'Imputed', 'Expected', 'chi_sqaure']))
+    if sum_chi_sqaure < 3.841:
+        print("The genotypes are NOT significantly different from expected Hardy-Weinberg equilibrium.")
+    else:
+        print("The genotypes ARE significantly different from expected Hardy-Weinberg equilibrium.")
+   
+hwt(afr['genotype'].to_list())
+hwt(eur['genotype'].to_list())
+
+
+*********************
+*R code for analyses*
+*********************
+
+# Prerequisite
+library(tidyverse)
+library(grid)
+library(data.table)
+library(ggpubr)
+library(rstatix)
+library(gee)
+library(geepack)
+set.seed(105)
+
+# Baseline
+## Data Loading
+afr_hp = read.csv('Afr_charter_chr16_shapeit2_prephased_HP.HP_0.9.hp.csv', header = T) %>% na.omit(.)
+eur_hp = read.csv('Eur_charter_chr16_shapeit2_prephased_HP.HP_0.9.hp.csv', header = T) %>% na.omit(.)
+gds = read.csv('phenotype/charter_update_GDS+covar.csv', header = T)
+gds$rnlog10_plasma <- as.numeric(gds$rnlog10_plasma)
+gds$GDS_Impairment_pe <- factor(gds$GDS_Impairment_pe, levels = c('nml','imp'), labels = c('nml','imp'))
+gds$estimated_duration_hiv_months <- as.numeric(gds$estimated_duration_hiv_months)
+gds$comorbidity <- factor(gds$comorbidity, label=c('incidental', 'contributing'), levels = c('incidental', 'contributing'))
+csf_hp = read.table('phenotype/charter_csf.txt', header = T)
+csf_hp$csf_haptoglobin <- as.numeric(as.character(csf_hp$csf_haptoglobin))
+csf_hp_cov = inner_join(csf_hp, gds, by = 'study_id')
+afr_hp$hp1_dom = 1 - as.numeric(afr_hp$genotype == 'HP2/HP2')
+eur_hp$hp1_dom = 1 - as.numeric(eur_hp$genotype == 'HP2/HP2')
+afr_hp$hp2_dom = 1 - as.numeric(afr_hp$genotype == 'HP1/HP1')
+eur_hp$hp2_dom = 1 - as.numeric(eur_hp$genotype == 'HP1/HP1')
+afr_hp$hp2_dos = as.numeric(as.factor(afr_hp$genotype)) - 1
+eur_hp$hp2_dos = as.numeric(as.factor(eur_hp$genotype)) - 1
+csf_hp_cov$log_csf_hp = log(as.numeric(as.character(csf_hp_cov$csf_haptoglobin)))
+csf_hp_cov <- na.omit(csf_hp_cov)
+afr_gds = inner_join(afr_hp, gds, how = 'left', by = c('id' = 'study_id'))
+afr_gds_apoe = inner_join(afr_gds, apoe, by = c('id' = 'study_id'))
+eur_gds = inner_join(eur_hp, gds, how = 'left', by = c('id' = 'study_id'))
+eur_gds_apoe = inner_join(eur_gds, apoe, by = c('id' = 'study_id'))
+all_gds = rbind(eur_gds,afr_gds)
+all_gds_apoe = rbind(eur_gds_apoe, afr_gds_apoe)
+afr_csf = inner_join(afr_hp, csf_hp_cov, by = c('id' = 'study_id'))
+eur_csf = inner_join(eur_hp, csf_hp_cov, by = c('id' = 'study_id'))
+afr_gds_csf = inner_join(afr_gds, afr_csf, by = 'id')
+eur_gds_csf = inner_join(eur_gds, eur_csf, by = 'id')
+all_gds_csf = rbind(eur_gds_csf, afr_gds_csf)
+all_csf = rbind(eur_csf, afr_csf)
+
+## CSF ANOVA
+summary(aov(afr_csf$log_csf_hp ~ afr_csf$genotype))
+summary(aov(eur_csf$log_csf_hp ~ eur_csf$genotype))
+summary(aov(log_csf_hp ~ genotype + pc1 + pc2 + pc3, data = all_csf))
+
+## NCI
+### Chi-square Test
+chisq.test(afr_gds$GDS_Impairment_pe, afr_gds$genotype)
+chisq.test(eur_gds$GDS_Impairment_pe, eur_gds$genotype)
+
+### Logistic Regression
+summary(glm(GDS_Impairment_pe ~ hp2_dos + rnlog10_plasma + comorbidity + age + gender + nadir_CD4, data = afr_gds, family = "binomial"))
+summary(glm(GDS_Impairment_pe ~ hp2_dom + rnlog10_plasma + comorbidity + age + gender + nadir_CD4, data = afr_gds, family = "binomial"))
+summary(glm(GDS_Impairment_pe ~ hp2_dos  + rnlog10_plasma + comorbidity + age + gender + nadir_CD4, data = eur_gds, family = "binomial"))
+summary(glm(GDS_Impairment_pe ~ hp2_dom + rnlog10_plasma + comorbidity + age + gender + nadir_CD4, data = eur_gds, family = "binomial"))
+summary(glm(GDS_Impairment_pe ~ hp1_dom + rnlog10_plasma + comorbidity + age + gender + nadir_CD4, data = eur_gds, family = "binomial"))
+
+# Longitudinal
+## Load data
+age2year <- function(df, id, visit, age) {
+    df[,visit] <- as.numeric(df[,visit])
+    df[,age] <- as.numeric(df[,age])
+    month <- c()
+    for (i in unique(df[,id])){
+        sdf <- df[which(df[,id] == i),]
+        if (nrow(sdf) > 1) {
+            if (sdf[,age][1] == sdf[,age][2]) {
+                month <- c(month, sdf[,visit]/12 + sdf[,age][1]) #convert by adding visit months to age at visit0
+            }
+            else {
+                month <- c(month, sdf[,visit]/12 + sdf[,age][1]+0.5) #since the repeated measures were taken with an interval of 6 months. So if the first 2 ages are not the same, the former one has to be taken at the later half of the age-year. So we add 6 months.
+            }
+        }
+        else {
+            month <- c(month, sdf[,age][1])
+        }
+    }
+    return(month)
+}
+
+afr_hp = read.csv('Afr_charter_chr16_shapeit2_prephased_HP.HP_0.9.hp.csv', header = T)
+afr_hp$genotype <- as.factor(afr_hp$genotype)
+eur_hp = read.csv('Eur_charter_chr16_shapeit2_prephased_HP.HP_0.9.hp.csv', header = T) 
+eur_hp$genotype <- as.factor(eur_hp$genotype)
+lgds <- read.csv("phenotype/charter_longitudinal_impairment_pe.csv") %>% 
+    select(study_id, visit, comorbidity, GDS_pe, ethnicity_cluster,
+           GDS_Impairment_pe, gender, age, rnlog10_plasma, nadir_CD4, pc1, pc2, pc3)
+#lgds$visit  <- as.factor(lgds$visit)
+lgds$gender <- as.factor(lgds$gender)
+lgds$GDS_Impairment_pe <- as.factor(lgds$GDS_Impairment_pe)
+lgds$comorbidity <- factor(lgds$comorbidity, label=c('incidental', 'contributing'), levels = c('incidental', 'contributing'))
+lgds$rnlog10_plasma <- as.numeric(as.character(lgds$rnlog10_plasma))
+lgds$GDS_pe <- as.numeric(as.character(lgds$GDS_pe))
+lgds<- lgds[order(lgds$study_id),]
+lgds$age <- age2year(lgds, 'study_id', 'visit', 'age')
+afr_hp$hp1_dom = as.factor(1 - as.numeric(afr_hp$genotype == 'HP2/HP2'))
+eur_hp$hp1_dom = as.factor(1 - as.numeric(eur_hp$genotype == 'HP2/HP2'))
+afr_hp$hp2_dom = as.factor(1 - as.numeric(afr_hp$genotype == 'HP1/HP1'))
+eur_hp$hp2_dom = as.factor(1 - as.numeric(eur_hp$genotype == 'HP1/HP1'))
+afr_hp$hp2_dos = as.numeric(afr_hp$genotype) - 1
+eur_hp$hp2_dos = as.numeric(eur_hp$genotype) - 1
+afr_gds = left_join(afr_hp, lgds, how = 'left', by = c('id' = 'study_id'))
+afr_gds$id <- as.factor(afr_gds$id)
+eur_gds = left_join(eur_hp, lgds, how = 'left', by = c('id' = 'study_id'))
+eur_gds$id <- as.factor(eur_gds$id)
+all_gds = rbind(eur_gds,afr_gds)
+afr_gds <- afr_gds %>% select(-c(pc1, pc2, pc3))
+eur_gds <- eur_gds %>% select(-c(pc1, pc2, pc3))
+
+filterByTime <- function(df, time, max) {
+    st1 <- df[which(df[,time] <= max),] %>% na.omit(.)
+    for (i in c('GDS_Impairment_pe', 'comorbidity')) {
+        st1[,i] <- factor(st1[,i])
+    }
+    return(st1)
+}
+
+afr_gds_500 <- filterByTime(afr_gds, 'age', 500)
+eur_gds_500 <- filterByTime(eur_gds, 'age', 500)
+all_gds_42 <- filterByTime(all_gds, 'age', 500)
+
+## Meian Follow-up
+followUpDf <- function(df) {
+    ids <- unique(df$id)
+    followUps <- c()
+    for (i in ids) {
+        followUp <- max(df$age[which(df$id==i)])-min((df$age[which(df$id==i)]))
+        followUps <- c(followUps, followUp)
+    }
+    return(data.frame(id = ids, follow_up = followUps))
+}
+
+afr_42_fl <- followUpDf(afr_gds_500); afrMedian <- median(afr_42_fl$follow_up); afrMean <- mean(afr_42_fl$follow_up)
+eur_42_fl <- followUpDf(eur_gds_500); eurMedian <- median(eur_42_fl$follow_up); eurMean <- mean(eur_42_fl$follow_up)
+
+## GDS GEE
+
+summary(geeglm(GDS_pe ~ hp2_dom * age + gender + rnlog10_plasma + nadir_CD4  + comorbidity,
+               data = afr_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(GDS_pe ~ hp2_dom * age + gender + rnlog10_plasma + nadir_CD4  + comorbidity,
+               data = eur_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))               
+
+## NCI GEE
+
+summary(geeglm(nGDS_Imp_pe ~ hp2_dos * age + gender + rnlog10_plasma + nadir_CD4 + comorbidity,
+               data = afr_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(nGDS_Imp_pe ~ hp2_dom * age + gender + rnlog10_plasma + nadir_CD4 + comorbidity,
+               data = afr_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(nGDS_Imp_pe ~ hp2_dos * age + gender + rnlog10_plasma + nadir_CD4 + comorbidity,
+               data = eur_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(nGDS_Imp_pe ~ hp2_dom * age + gender + rnlog10_plasma + nadir_CD4 + comorbidity,
+               data = eur_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))               
+
+## Domain
+### Data Manipulation
+domt <- c('Global_Mean_T_pe', 'Verbal_Mean_T_pe', 'Exec_Mean_T_pe', 'SIP_Mean_T_pe', 'Learn_Mean_T_pe', 'Recall_Mean_T_pe', 'Wrk_Mem_Mean_T_pe', 'Motor_Mean_T_pe')
+domi <- c( 'global_impairment_pe', 'verbal_impairment_pe', 'exec_impairment_pe', 'sip_impairment_pe', 'learn_impairment_pe', 'recall_impairment_pe', 'wrk_mem_impairment_pe', 'motor_impairment_pe')
+lgds <- read.csv("../../../../phenotype/charter_longitudinal_impairment_pe.csv") %>% 
+    select(study_id, visit, comorbidity, GDS_pe, ethnicity_cluster,
+           GDS_Impairment_pe, Global_Mean_T_pe, Verbal_Mean_T_pe, Exec_Mean_T_pe, SIP_Mean_T_pe, Learn_Mean_T_pe, 
+           Recall_Mean_T_pe, Wrk_Mem_Mean_T_pe, Motor_Mean_T_pe, verbal_impairment_pe, wrk_mem_impairment_pe, exec_impairment_pe, 
+           sip_impairment_pe, wrk_mem_impairment_pe, learn_impairment_pe, recall_impairment_pe, motor_impairment_pe, 
+           global_impairment_pe, gender, age, rnlog10_plasma, nadir_CD4, pc1, pc2, pc3)
+lgds$gender <- as.factor(lgds$gender)
+lgds$GDS_Impairment_pe <- as.factor(lgds$GDS_Impairment_pe)
+lgds$comorbidity <- factor(lgds$comorbidity, label=c('incidental', 'contributing'), levels = c('incidental', 'contributing'))
+lgds$rnlog10_plasma <- as.numeric(as.character(lgds$rnlog10_plasma))
+lgds$GDS_pe <- as.numeric(as.character(lgds$GDS_pe))
+lgds$age <- age2month(lgds, 'study_id', 'visit', 'age')
+for (i in domt) {
+    lgds[,i] <- as.numeric(as.character(lgds[,i]))
+}
+for (i in domi) {
+    lgds[,i] <- as.numeric(as.character(lgds[,i]))
+}        
+afr_gds = left_join(afr_hp, lgds, how = 'left', by = c('id' = 'study_id'))
+afr_gds$id <- as.factor(afr_gds$id)
+eur_gds = left_join(eur_hp, lgds, how = 'left', by = c('id' = 'study_id'))
+eur_gds$id <- as.factor(eur_gds$id)
+all_gds = rbind(eur_gds,afr_gds)
+afr_gds <- afr_gds %>% select(-c(pc1, pc2, pc3))
+eur_gds <- eur_gds %>% select(-c(pc1, pc2, pc3))
+afr_gds_500 <- filterByTime(afr_gds, 'age', 500)
+eur_gds_500 <- filterByTime(eur_gds, 'age', 500)
+
+### T-score GEE
+summary(geeglm(Learn_Mean_T_pe ~ hp2_dos * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = afr_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(Learn_Mean_T_pe ~ hp2_dom * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = afr_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(Recall_Mean_T_pe ~ hp2_dos * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = afr_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(Recall_Mean_T_pe ~ hp2_dom * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = afr_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(Learn_Mean_T_pe ~ hp2_dos * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = eur_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(Learn_Mean_T_pe ~ hp2_dom * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = eur_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(Recall_Mean_T_pe ~ hp2_dos * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = eur_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(Recall_Mean_T_pe ~ hp2_dom * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = eur_gds_500, id = id, family = gaussian, corstr = 'ar1', na.action = na.omit))
+
+
+### Impairments GEE
+summary(geeglm(learn_impairment_pe ~ hp2_dos * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = afr_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(learn_impairment_pe ~ hp2_dom * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = afr_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(recall_impairment_pe ~ hp2_dos * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = afr_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(recall_impairment_pe ~ hp2_dom * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = afr_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(learn_impairment_pe ~ hp2_dos * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = eur_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(learn_impairment_pe ~ hp2_dom * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = eur_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(recall_impairment_pe ~ hp2_dos * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = eur_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+summary(geeglm(recall_impairment_pe ~ hp2_dom * age + gender + comorbidity + rnlog10_plasma + nadir_CD4, data = eur_gds_500, id = id, family = binomial, corstr = 'ar1', na.action = na.omit))
+
+
